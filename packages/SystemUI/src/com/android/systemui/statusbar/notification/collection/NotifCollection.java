@@ -1096,14 +1096,6 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
         }
         mLogger.logNotifInternalUpdate(entry, name, reason);
 
-        // First do the pieces of postNotification which are not about assuming the notification
-        // was sent by the app
-        entry.setSbn(sbn);
-        mEventQueue.add(new BindEntryEvent(entry, sbn));
-
-        mLogger.logNotifUpdated(entry);
-        mEventQueue.add(new EntryUpdatedEvent(entry, UpdateSource.SystemUi));
-
         Notification notification = sbn.getNotification();
         boolean isOngoingProgressUpdate = notification != null
                 && notification.extras != null
@@ -1114,6 +1106,7 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
             long now = mClock.elapsedRealtime();
             Long last = mLastProgressRebuildTimeForKey.get(sbn.getKey());
             if (last != null && (now - last) < PROGRESS_REBUILD_THROTTLE_MS) {
+                entry.setSbn(sbn);
                 final String key = sbn.getKey();
                 if (mPendingProgressFlushKeys.add(key)) {
                     long delay = PROGRESS_REBUILD_THROTTLE_MS - (now - last);
@@ -1121,6 +1114,8 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
                         mPendingProgressFlushKeys.remove(key);
                         if (mNotificationSet.get(key) != null) {
                             mLastProgressRebuildTimeForKey.put(key, mClock.elapsedRealtime());
+                            mEventQueue.add(new BindEntryEvent(entry, entry.getSbn()));
+                            mEventQueue.add(new EntryUpdatedEvent(entry, UpdateSource.SystemUi));
                             dispatchEventsAndRebuildList("progressThrottleFlush");
                         }
                     }, delay);
@@ -1129,6 +1124,12 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
             }
             mLastProgressRebuildTimeForKey.put(sbn.getKey(), now);
         }
+
+        entry.setSbn(sbn);
+        mEventQueue.add(new BindEntryEvent(entry, sbn));
+
+        mLogger.logNotifUpdated(entry);
+        mEventQueue.add(new EntryUpdatedEvent(entry, UpdateSource.SystemUi));
 
         // Skip the applyRanking step and go straight to dispatching the events
         dispatchEventsAndCoalescedRebuildList("updateNotificationInternally");
