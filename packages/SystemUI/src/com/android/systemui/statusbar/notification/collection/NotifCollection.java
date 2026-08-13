@@ -166,6 +166,10 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
             Collections.unmodifiableCollection(mNotificationSet.values());
     private final HashMap<String, FutureDismissal> mFutureDismissals = new HashMap<>();
 
+    private final Map<String, Long> mLastProgressRebuildTimeForKey = new HashMap<>();
+    private final HashSet<String> mPendingProgressFlushKeys = new HashSet<>();
+    private static final long PROGRESS_REBUILD_THROTTLE_MS = 400;
+
     @Nullable private CollectionReadyForBuildListener mBuildListener;
     private final NamedListenerSet<NotifCollectionListener>
             mNotifCollectionListeners = new NamedListenerSet<>();
@@ -177,6 +181,14 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
     private final Runnable mRebuildListRunnable = () -> {
         if (mBuildListener != null) {
             mBuildListener.onBuildList(mReadOnlyNotificationSet, "asynchronousUpdate");
+        }
+    };
+
+    private static final long REBUILD_COALESCE_WINDOW_MS = 32L;
+    private String mCoalescedRebuildReason = "coalescedRebuild";
+    private final Runnable mCoalescedRebuildRunnable = () -> {
+        if (mBuildListener != null) {
+            mBuildListener.onBuildList(mReadOnlyNotificationSet, mCoalescedRebuildReason);
         }
     };
 
@@ -490,7 +502,7 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
 
         postNotification(sbn, requireRanking(rankingMap, sbn.getKey()));
         applyRanking(rankingMap);
-        dispatchEventsAndRebuildList("onNotificationPosted");
+        dispatchEventsAndCoalescedRebuildList("onNotificationPosted");
     }
 
     private void onNotificationGroupPosted(List<CoalescedEvent> batch) {
@@ -501,7 +513,7 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
         for (CoalescedEvent event : batch) {
             postNotification(event.getSbn(), event.getRanking());
         }
-        dispatchEventsAndRebuildList("onNotificationGroupPosted");
+        dispatchEventsAndCoalescedRebuildList("onNotificationGroupPosted");
     }
 
     private void onNotificationRemoved(
@@ -522,14 +534,14 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
         entry.mCancellationReason = reason;
         tryRemoveNotification(entry);
         applyRanking(rankingMap);
-        dispatchEventsAndRebuildList("onNotificationRemoved");
+        dispatchEventsAndCoalescedRebuildList("onNotificationRemoved");
     }
 
     private void onNotificationRankingUpdate(RankingMap rankingMap) {
         Assert.isMainThread();
         mEventQueue.add(new RankingUpdatedEvent(rankingMap));
         applyRanking(rankingMap);
-        dispatchEventsAndRebuildList("onNotificationRankingUpdate");
+        dispatchEventsAndCoalescedRebuildList("onNotificationRankingUpdate");
     }
 
     private void onNotificationChannelModified(
@@ -622,6 +634,8 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
         if (!isLifetimeExtended(entry)) {
             mLogger.logNotifReleased(entry);
             mNotificationSet.remove(entry.getKey());
+            mLastProgressRebuildTimeForKey.remove(entry.getKey());
+            mPendingProgressFlushKeys.remove(entry.getKey());
             cancelDismissInterception(entry);
             mEventQueue.add(new EntryRemovedEvent(entry, entry.mCancellationReason));
             mEventQueue.add(new CleanUpEntryEvent(entry));
@@ -719,6 +733,20 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
         if (mBuildListener != null) {
             mBuildListener.onBuildList(mReadOnlyNotificationSet, reason);
         }
+        Trace.endSection();
+    }
+
+    private void dispatchEventsAndCoalescedRebuildList(String reason) {
+        Trace.beginSection("NotifCollection.dispatchEventsAndCoalescedRebuildList");
+
+        dispatchEvents();
+
+        mCoalescedRebuildReason = reason;
+        if (mMainHandler.hasCallbacks(mCoalescedRebuildRunnable)) {
+            mMainHandler.removeCallbacks(mCoalescedRebuildRunnable);
+        }
+        mMainHandler.postDelayed(mCoalescedRebuildRunnable, REBUILD_COALESCE_WINDOW_MS);
+
         Trace.endSection();
     }
 
@@ -1076,8 +1104,34 @@ public class NotifCollection implements Dumpable, PipelineDumpable {
         mLogger.logNotifUpdated(entry);
         mEventQueue.add(new EntryUpdatedEvent(entry, UpdateSource.SystemUi));
 
+        Notification notification = sbn.getNotification();
+        boolean isOngoingProgressUpdate = notification != null
+                && notification.extras != null
+                && notification.extras.containsKey(Notification.EXTRA_PROGRESS)
+                && sbn.isOngoing();
+
+        if (isOngoingProgressUpdate) {
+            long now = mClock.elapsedRealtime();
+            Long last = mLastProgressRebuildTimeForKey.get(sbn.getKey());
+            if (last != null && (now - last) < PROGRESS_REBUILD_THROTTLE_MS) {
+                final String key = sbn.getKey();
+                if (mPendingProgressFlushKeys.add(key)) {
+                    long delay = PROGRESS_REBUILD_THROTTLE_MS - (now - last);
+                    mMainHandler.postDelayed(() -> {
+                        mPendingProgressFlushKeys.remove(key);
+                        if (mNotificationSet.get(key) != null) {
+                            mLastProgressRebuildTimeForKey.put(key, mClock.elapsedRealtime());
+                            dispatchEventsAndRebuildList("progressThrottleFlush");
+                        }
+                    }, delay);
+                }
+                return;
+            }
+            mLastProgressRebuildTimeForKey.put(sbn.getKey(), now);
+        }
+
         // Skip the applyRanking step and go straight to dispatching the events
-        dispatchEventsAndRebuildList("updateNotificationInternally");
+        dispatchEventsAndCoalescedRebuildList("updateNotificationInternally");
     }
 
     /**
