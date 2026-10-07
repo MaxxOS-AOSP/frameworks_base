@@ -196,7 +196,7 @@ public class NotificationShadeWindowViewController implements Dumpable {
             DockManager dockManager,
             NotificationShadeDepthController depthController,
             NotificationShadeWindowView notificationShadeWindowView,
-            NotificationPanelViewController notificationPanelViewController,
+            Provider<NotificationPanelViewController> notificationPanelViewControllerProvider,
             ShadeViewController shadeViewController,
             ShadeAnimationInteractor shadeAnimationInteractor,
             PanelExpansionInteractor panelExpansionInteractor,
@@ -237,7 +237,8 @@ public class NotificationShadeWindowViewController implements Dumpable {
         mStatusBarStateController = statusBarStateController;
         mView = notificationShadeWindowView;
         mDockManager = dockManager;
-        mNotificationPanelViewController = notificationPanelViewController;
+        mNotificationPanelViewController = SceneContainerFlag.isEnabled()
+                ? null : notificationPanelViewControllerProvider.get();
         mShadeViewController = shadeViewController;
         mPanelExpansionInteractor = panelExpansionInteractor;
         mShadeExpansionStateManager = shadeExpansionStateManager;
